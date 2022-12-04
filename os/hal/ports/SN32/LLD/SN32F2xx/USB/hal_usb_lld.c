@@ -464,21 +464,68 @@ void handleACK(USBDriver* usbp, usbep_t ep) {
 void handleNAK(USBDriver *usbp, usbep_t ep) {
     uint8_t out = 0;
 
-    if(ep > 0 && ep <= USB_MAX_ENDPOINTS)
-    {
-        // Determine the interrupting endpoint direction
+    if(ep > 0 && ep <= USB_MAX_ENDPOINTS) {
         out = ( SN32_USB->CFG & mskEPn_DIR(ep) ) == mskEPn_DIR(ep);
     }
     else {
         return;
     }
 
-    if(!out) // ack only required for in endpoints
-    {
-        _usb_isr_invoke_in_cb(usbp, ep);
-    }
 
+    if(out)
+    {
+        // no ack required here
+    }
+    else
+    {
+        // This is not a retransmission, retransmission is transparent and happens on phy layer
+        // NAK happens when host polls IN EP and device has nothing to send
+        // It has been observed that sometimes USB phy doesn't generate ACK (unknown why)
+        // (count ACK interrupts didn't match count of usb_lld_start_in calls per EP)
+        // However while USB transmitting and qmk thread wants to send another packet qmk goes to
+        // infinite sleep, expecting that successfull USB transmission will wake it up
+        // If USB transmission never completes (no ACK) then qmk never wakes up and keyboard locks up
+        // To prevent this every NAK (1ms or 8ms depending on host poll interval) was calling
+        // callbacks and wake up function to wake up qmk thread, however packet was not delivered to host
+        // (for unknown reason) and thus we have seen:
+        // 1) stuck keypresses when usb packets to press key delivered but key release packet lost
+        // 2) untyped key when usb packet to press key was lost but key release packet delivered
+        // Because callback was called every NAK some qmk features didnt work such as CONSOLE
+        // since callback might release buffers and endup in deadlock via disabled interrupts
+        // callback for keyboard is empty thus its repated calling is harmless
+        #if defined(SN32_USB_ORIGINAL_NAK_HANDLING)
+        _usb_isr_invoke_in_cb(usbp, ep);
+        #else
+        //To fake missing ACK we can send 0 sized packet
+        //however (again for unknown reason) packets now being delivered to host as well!
+        //- value 2 has been selected to allow at least 2 NAK delivery (2ms or 16ms depending on
+        //host polling interval) between moment qmk called start_in and moment USB phy actually
+        //started transmission
+        //- value 10 was selected arbitrary.
+        //- values 3-10 we are delivering 0 sized packet trying to get at least one ack
+        if (nakcnt[ep] > 0) {
+            //qmk called start_in
+            if (nakcnt[ep] > 10) {
+                //11-....
+                //consider packet undeliverable but ack it to the qmk
+                nakcnt[ep] = 0;
+                _usb_isr_invoke_in_cb(usbp, ep);
+            }
+            else if (nakcnt[ep] > 2) {
+                //3-10
+                nakcnt[ep]++;
+                EPCTL_SET_STAT_ACK(ep, 0);
+            }
+            else {
+                //1-2
+                //give it sometime to deliver the packet
+                nakcnt[ep]++;
+            }
+        }
+        #endif
+    }
 }
+
 /*===========================================================================*/
 /* Driver interrupt handlers and threads.                                    */
 /*===========================================================================*/
